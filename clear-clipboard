@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# clear-clipboard: Clears the system clipboard (both selection and clipboard buffers)
+# Usage: clear-clipboard
+
+die()  { echo "❌ $*" >&2; exit 1; }
+
+if command -v xclip &>/dev/null; then
+  echo -n "" | xclip -selection clipboard
+  echo -n "" | xclip -selection primary
+  echo "✅ Clipboard cleared."
+elif command -v xsel &>/dev/null; then
+  xsel --clipboard --clear
+  xsel --primary --clear
+  echo "✅ Clipboard cleared."
+else
+  die "No clipboard tool found. Install one with: sudo apt install xclip"
+fi

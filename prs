@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# prs: List all my open PRs with conflict and review status
+# Usage: prs
+
+set -eo pipefail
+
+die()  { echo "❌ $*" >&2; exit 1; }
+info() { echo "ℹ️  $*"; }
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+R='\033[0;31m'   # red
+Y='\033[0;33m'   # yellow
+B='\033[0;34m'   # blue
+G='\033[0;32m'   # green
+W='\033[1;37m'   # bold white
+D='\033[0;90m'   # dim
+NC='\033[0m'     # reset
+
+# ── Fetch upstream repo ───────────────────────────────────────────────────────
+UPSTREAM_REPO=$(git remote get-url upstream 2>/dev/null \
+  | sed 's|.*github.com[:/]||;s|.git$||') || true
+
+[[ -z "$UPSTREAM_REPO" ]] \
+  && die "No upstream remote found. Are you in the right repo?"
+
+ME=$(gh api user --jq '.login' 2>/dev/null) \
+  || die "Failed to get GitHub user. Is 'gh' authenticated?"
+
+info "Fetching your open PRs from ${UPSTREAM_REPO}..."
+
+# ── Fetch all open, non-draft PRs authored by me ─────────────────────────────
+PRS_JSON=$(gh pr list \
+  --repo "$UPSTREAM_REPO" \
+  --author "$ME" \
+  --state open \
+  --json number,title,headRefName,baseRefName,mergeable,reviewDecision,url,updatedAt,createdAt,isDraft \
+  --limit 50 2>/dev/null) || die "Failed to fetch PRs."
+
+# Filter out drafts
+PRS_JSON=$(echo "$PRS_JSON" | python3 -c "
+import sys, json
+prs = json.load(sys.stdin)
+prs = [pr for pr in prs if not pr.get('isDraft', False)]
+print(json.dumps(prs))
+")
+
+TOTAL=$(echo "$PRS_JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+
+if [[ "$TOTAL" == "0" ]]; then
+  echo ""
+  echo -e "${G}No open PRs found.${NC}"
+  exit 0
+fi
+
+echo ""
+echo -e "${W}Open Pull Requests (${TOTAL})${NC}"
+echo -e "${D}$(printf '─%.0s' {1..50})${NC}"
+echo ""
+
+# ── Process each PR ───────────────────────────────────────────────────────────
+echo "$PRS_JSON" | python3 -c "
+import sys, json
+prs = json.load(sys.stdin)
+for pr in prs:
+    print(json.dumps(pr))
+" | while IFS= read -r pr_line; do
+
+  # Parse all fields in one python call to avoid spawning 8 subshells per PR
+  eval "$(echo "$pr_line" | python3 -c "
+import sys, json, datetime
+
+pr = json.loads(sys.stdin.read())
+now = datetime.datetime.now(datetime.timezone.utc)
+
+# Updated ago
+updated = datetime.datetime.fromisoformat(pr['updatedAt'].replace('Z','+00:00'))
+diff = now - updated
+total_hours = diff.days * 24 + diff.seconds // 3600
+total_mins  = diff.seconds % 3600 // 60
+if diff.days > 0:
+    updated_str = f'{diff.days}d ago'
+elif total_hours > 0:
+    updated_str = f'{total_hours}h ago'
+elif total_mins > 0:
+    updated_str = f'{total_mins}m ago'
+else:
+    updated_str = 'just now'
+
+# Stale warning (opened date)
+created = datetime.datetime.fromisoformat(pr['createdAt'].replace('Z','+00:00'))
+age_days = (now - created).days
+if age_days >= 365:
+    age_str = f\"{age_days // 365}y {(age_days % 365) // 30}m old\"
+elif age_days >= 30:
+    age_str = f'{age_days}d old'
+else:
+    age_str = ''
+
+def q(s): return s.replace(\"'\", \"'\\\\''\")
+
+print(f\"NUMBER='{pr['number']}'\")
+print(f\"TITLE='{q(pr['title'])}'\")
+print(f\"HEAD='{q(pr['headRefName'])}'\")
+print(f\"BASE='{q(pr['baseRefName'])}'\")
+print(f\"MERGEABLE='{pr['mergeable']}'\")
+print(f\"DECISION='{pr['reviewDecision'] or ''}'\")
+print(f\"URL='{pr['url']}'\")
+print(f\"UPDATED_STR='{updated_str}'\")
+print(f\"AGE_STR='{age_str}'\")
+")"
+
+  HAS_CONFLICT=false
+  HAS_CHANGES=false
+  IS_APPROVED=false
+  [[ "$MERGEABLE" == "CONFLICTING" ]]       && HAS_CONFLICT=true
+  [[ "$DECISION" == "CHANGES_REQUESTED" ]]  && HAS_CHANGES=true
+  [[ "$DECISION" == "APPROVED" ]]           && IS_APPROVED=true
+
+  # ── Fetch unresolved change-request reviews ───────────────────────────────
+  REVIEWS="[]"
+  if $HAS_CONFLICT && $HAS_CHANGES; then
+    ICON="${R}✖${NC}"
+    BADGES="${R}(conflict)${NC} ${Y}(changes requested)${NC}"
+  elif $HAS_CONFLICT; then
+    ICON="${R}✖${NC}"
+    BADGES="${R}(conflict)${NC}"
+  elif $HAS_CHANGES; then
+    ICON="${Y}!${NC}"
+    BADGES="${Y}(changes requested)${NC}"
+  elif $IS_APPROVED; then
+    ICON="${G}✔${NC}"
+    BADGES="${G}(approved)${NC}"
+  else
+    ICON="${B}~${NC}"
+    BADGES="${B}(awaiting review)${NC}"
+  fi
+
+  # ── Stale tag ─────────────────────────────────────────────────────────────
+  STALE=""
+  [[ -n "$AGE_STR" ]] && STALE="  ${R}stale: ${AGE_STR}${NC}"
+
+  # ── Print PR ──────────────────────────────────────────────────────────────
+  echo -e "  ${ICON}  ${W}#${NUMBER}${NC} ${TITLE}  ${BADGES}"
+  echo -e "      ${D}base: ${BASE} <- ${HEAD}  ·  updated ${UPDATED_STR}${NC}${STALE}"
+  echo -e "      ${D}${URL}${NC}"
+
+  # ── Print unresolved review comments (deduped, skip empty) ───────────────
+  if $HAS_CHANGES && [[ "$REVIEWS" != "[]" ]]; then
+    echo "$REVIEWS" | python3 -c "
+import sys, json
+reviews = json.load(sys.stdin)
+seen = set()
+for r in reviews:
+    user = r['user']
+    body = r['body'].strip()
+    if not body or user in seen:
+        continue
+    seen.add(user)
+    lines = body.splitlines()
+    first_line = lines[0][:80] + ('...' if len(lines[0]) > 80 else '')
+    print(f'      {user}: \"{first_line}\"')
+" | while IFS= read -r comment; do
+      echo -e "  ${Y}↳ ${comment}${NC}"
+    done
+  fi
+
+  echo ""
+done
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo -e "${D}$(printf '─%.0s' {1..50})${NC}"
+
+echo "$PRS_JSON" | python3 -c "
+import sys, json
+prs = json.load(sys.stdin)
+
+critical = changes = awaiting = approved = 0
+for pr in prs:
+    conflict   = pr['mergeable'] == 'CONFLICTING'
+    req_change = pr['reviewDecision'] == 'CHANGES_REQUESTED'
+    appr       = pr['reviewDecision'] == 'APPROVED'
+
+    if conflict and req_change: critical += 1
+    elif conflict:              critical += 1
+    elif req_change:            changes  += 1
+    elif appr:                  approved += 1
+    else:                       awaiting += 1
+
+parts = []
+if critical: parts.append(('\033[0;31m', f'✖ {critical} conflict'))
+if changes:  parts.append(('\033[0;33m', f'! {changes} changes requested'))
+if awaiting: parts.append(('\033[0;34m', f'~ {awaiting} awaiting review'))
+if approved: parts.append(('\033[0;32m', f'✔ {approved} approved'))
+
+nc  = '\033[0m'
+dim = '\033[0;90m'
+sep = f'{dim}  .  {nc}'
+print(sep.join(f'{c}{t}{nc}' for c, t in parts))
+"
+echo ""

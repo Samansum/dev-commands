@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# update-for-qa: Move "Deployed to UAT" tickets to "Pending QA"
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+R='\033[0;31m'      # Red
+O='\033[38;5;208m'  # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+error()  { echo -e "${R}✖${NC} $*"; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+warn() { echo -e "${O}▲${NC} $*"; }
+
+TARGET_STATUS="Pending QA"
+
+# ── Query tickets ─────────────────────────────────────────────────────────────
+info "Querying tickets: mine + Deployed to UAT..."
+
+JQL=$(build-jql --mine --status "Deployed to UAT" --type Defect Bug Improvement)
+
+RAW=$(acli jira workitem search \
+  --jql "$JQL" \
+  --fields "key,summary,status,assignee" \
+  --json --limit 200)
+
+# ── Parse ─────────────────────────────────────────────────────────────────────
+mapfile -t ITEMS < <(echo "$RAW" | jq -c '.[]?')
+
+[[ ${#ITEMS[@]} -eq 0 ]] && die "No tickets found."
+
+# ── Found tickets ─────────────────────────────────────────────────────────────
+echo
+info "Found tickets (${#ITEMS[@]}):"
+
+declare -A SUMMARY_MAP
+declare -a KEYS
+
+for item in "${ITEMS[@]}"; do
+  key=$(echo "$item" | jq -r '.key')
+  summary=$(echo "$item" | jq -r '.fields.summary')
+
+  SUMMARY_MAP["$key"]="$summary"
+  KEYS+=("$key")
+
+  echo -e "  • ${D}$key${NC} | $summary"
+done
+
+echo
+
+# ── Processing ────────────────────────────────────────────────────────────────
+SUCCESS=0
+FAILED=0
+
+for key in "${KEYS[@]}"; do
+  summary="${SUMMARY_MAP[$key]}"
+
+  echo -e "▸ Processing ${C}$key${NC}"
+  echo -e "  $summary"
+  echo -e "  Deployed to UAT → ${Y}$TARGET_STATUS${NC}"
+
+  if transition-ticket-status "$key" "$TARGET_STATUS" >/dev/null 2>&1; then
+    ok "Updated $key"
+    ((SUCCESS++))
+  else
+    warn "Failed $key"
+    ((FAILED++))
+  fi
+
+  echo
+done
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo -e "${D}──────────────────────────────────────${NC}"
+echo -e "  ${G}Success:${NC} $SUCCESS"
+echo -e "  ${R}Failed:${NC}  $FAILED"
+echo -e "${D}──────────────────────────────────────${NC}"
+
+[[ $FAILED -gt 0 ]] && exit 1

@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# new-ticket: Creates a new git branch from current branch for a Jira ticket,
+#             assigns the ticket to you, and advances its status to "In Progress"
+# Usage: new-ticket CW-123
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+R='\033[0;31m'      # Red
+O='\033[38;5;208m'  # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+error()  { echo -e "${R}✖${NC} $*"; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+warn() { echo -e "${O}▲${NC} $*"; }
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+[[ $# -lt 1 ]] && die "Usage: new-ticket <TICKET-KEY>  (e.g. new-ticket CW-123)"
+
+TICKET_KEY="${1^^}"  # uppercase
+
+[[ ! "$TICKET_KEY" =~ ^[A-Z]+-[0-9]+$ ]] \
+  && die "Invalid ticket key '$TICKET_KEY'. Expected format: CW-123"
+
+# ── Ensure we're in a git repo ────────────────────────────────────────────────
+git rev-parse --abbrev-ref HEAD &>/dev/null \
+  || die "Not inside a git repository."
+
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+info "Current branch: $CURRENT_BRANCH"
+
+# ── Create and switch to new branch ──────────────────────────────────────────
+if git show-ref --verify --quiet "refs/heads/$TICKET_KEY"; then
+  die "Branch '$TICKET_KEY' already exists locally."
+fi
+
+git checkout -b "$TICKET_KEY"
+ok "Created and switched to branch '$TICKET_KEY'"
+
+# ── Fetch current ticket info (status + assignee) ─────────────────────────────
+info "Fetching Jira ticket info..."
+
+TICKET_JSON=$(acli jira workitem view "$TICKET_KEY" --fields status,assignee --json 2>/dev/null) \
+  || die "Failed to fetch Jira ticket '$TICKET_KEY'. Is acli authenticated?"
+
+CURRENT_STATUS=$(echo "$TICKET_JSON" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+item = data[0] if isinstance(data, list) else data
+print(item['fields']['status']['name'])
+" 2>/dev/null) || die "Failed to parse ticket status."
+
+CURRENT_ASSIGNEE_ID=$(echo "$TICKET_JSON" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+item = data[0] if isinstance(data, list) else data
+assignee = item['fields'].get('assignee')
+print(assignee['accountId'] if assignee else '')
+" 2>/dev/null) || true
+
+info "Current status: $CURRENT_STATUS"
+
+# ── Assign to me ──────────────────────────────────────────────────────────────
+# Fetch my account ID via acli (whoami equivalent)
+MY_ACCOUNT_ID=$(acli jira workitem search \
+  --jql "assignee = currentUser() ORDER BY created DESC" \
+  --fields assignee \
+  --json 2>/dev/null \
+  | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+if data and len(data) > 0:
+    item = data[0] if isinstance(data, list) else data
+    assignee = item['fields'].get('assignee')
+    if assignee:
+        print(assignee['accountId'])
+" 2>/dev/null) || true
+
+if [[ -n "$MY_ACCOUNT_ID" && "$CURRENT_ASSIGNEE_ID" == "$MY_ACCOUNT_ID" ]]; then
+  info "Already assigned to you — skipping."
+else
+  info "Assigning ticket to you..."
+  acli jira workitem assign --key "$TICKET_KEY" --assignee "@me" --yes &>/dev/null \
+    && ok "Assigned ticket to you." \
+    || warn "Could not assign ticket — skipping."
+fi
+
+# ── Transition status to In Progress ─────────────────────────────────────────
+# Status flow: To Do → Ready → In Progress
+# We handle whatever the current status is smartly.
+
+case "$CURRENT_STATUS" in
+  "To Do")
+    transition-ticket-status "$TICKET_KEY" "Ready"
+    transition-ticket-status "$TICKET_KEY" "In Progress"
+    ;;
+  "In Progress")
+    info "Status is already 'In Progress' — skipping."
+    ;;
+  *)
+    transition-ticket-status "$TICKET_KEY" "In Progress"
+    ;;
+esac
+
+echo ""
+ok "Done! Branch '$TICKET_KEY' is ready and ticket is In Progress."
+
+echo ""
+echo "── Actions ──────────────────────────────────────────────────────────────────"
+echo -e "${D}[r: subtasks]  ·  [r: prlist]  ·  [r: update-pr --set-img]  ·  [r: update-pr]${NC}"

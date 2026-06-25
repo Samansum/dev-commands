@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# merged: Move Jira ticket to "Merged"
+# Usage: merged CW-123
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+R='\033[0;31m'      # Red
+O='\033[38;5;208m'  # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+die()  { echo -e "${R}✖${NC}  $*" >&2; exit 1; }
+error()  { echo -e "${R}✖${NC}  $*"; }
+info() { echo -e "${C}▶${NC}  $*"; }
+ok()   { echo -e "${G}✔${NC}  $*"; }
+warn() { echo -e "${O}▲${NC}  $*"; }
+
+# ── Args ─────────────────────────────────────────────────────────────────────
+[[ $# -lt 1 ]] && die "Usage: merged <TICKET-KEY>"
+
+TICKET_KEY="${1^^}"
+
+[[ ! "$TICKET_KEY" =~ ^[A-Z]+-[0-9]+$ ]] \
+  && die "Invalid ticket key '$TICKET_KEY'. Expected format: CW-123"
+
+# ── Fetch current status ────────────────────────────────────────────────────
+info "Fetching Jira ticket info..."
+CURRENT_STATUS=$(current-ticket-status "$TICKET_KEY")
+info "Current status: $CURRENT_STATUS"
+
+# ── Transition ───────────────────────────────────────────────────────────────
+if [[ "$CURRENT_STATUS" == "Merged" ]]; then
+  info "Status is already 'Merged' — skipping."
+  exit 0
+fi
+
+info "Transitioning to 'Merged'..."
+transition-ticket-status "$TICKET_KEY" "Merged"
+
+echo ""
+ok "Done! Ticket '$TICKET_KEY' is now Merged."

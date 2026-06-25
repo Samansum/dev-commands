@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# approve-pr: Approve a PR
+# Usage: approve-pr <pr-number>
+
+set -euo pipefail
+
+R='\033[0;31m'      # Red
+O='\033[38;5;208m'  # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+warn() { echo -e "${O}▲${NC} $*"; }
+
+[[ $# -lt 1 ]] && die "Usage: approve-pr <pr-number>"
+
+PR_NUMBER="$1"
+
+info "Approving PR #${PR_NUMBER}..."
+
+gh pr review "$PR_NUMBER" --approve \
+  || die "Failed to approve PR #${PR_NUMBER}."
+
+#ok "Approved PR #${PR_NUMBER}." #gh already has success log

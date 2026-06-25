@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+
+DONE_STATUSES='"Done","Closed","Resolved","Merged","Pending Release"'
+DONE_STATUSES_NO_MERGED='"Done","Closed","Resolved","Pending Release"'
+
+
+jql_not_done() {
+  echo "status NOT IN (${DONE_STATUSES})"
+}
+
+
+jql_not_done_no_merged() {
+  echo "status NOT IN (${DONE_STATUSES_NO_MERGED})"
+}
+
+
+jql_unassigned_or_failed_qa() {
+  echo "((assignee is EMPTY AND $(jql_not_done)) OR status = \"Failed QA\")"
+}
+
+
+jql_hide_done_clause() {
+  echo "($(jql_not_done) OR (type != \"Sub-task\" AND $(jql_not_done_no_merged)))"
+}
+
+build_jql() {
+  local key=''
+
+  local STATUSES=()
+  local TYPES=()
+
+  local SHOW_ALL='false'
+  local HIDE_DONE='false'
+  local NO_ASSIGNEE='false'
+  local MY_TASK='false'
+  local FOR_DEV='false'
+
+  local FIX_VERSION=''
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--all)
+        SHOW_ALL='true'
+        shift
+        ;;
+
+      --hide-done)
+        HIDE_DONE='true'
+        shift
+        ;;
+
+      --no-assignee)
+        NO_ASSIGNEE='true'
+        shift
+        ;;
+
+      --mine)
+        MY_TASK='true'
+        shift
+        ;;
+
+      --for-dev)
+        FOR_DEV='true'
+        shift
+        ;;
+
+      --fix-version)
+        FIX_VERSION="$2"
+        shift 2
+        ;;
+
+      --status)
+        shift
+
+        while [[ $# -gt 0 && "$1" != -* ]]; do
+          STATUSES+=("$1")
+          shift
+        done
+        ;;
+
+      --type)
+        shift
+
+        while [[ $# -gt 0 && "$1" != -* ]]; do
+          TYPES+=("$1")
+          shift
+        done
+        ;;
+
+      *)
+        key="$1"
+        shift
+        ;;
+    esac
+  done
+
+  local clauses=()
+
+  if [[ -n "$key" ]]; then
+    clauses+=("parent = ${key}")
+  fi
+
+  if [[ -n "$FIX_VERSION" ]]; then
+    clauses+=("fixVersion = ${FIX_VERSION}")
+  fi
+
+  if [[ ${#STATUSES[@]} -eq 0 ]]; then
+    if [[ "$SHOW_ALL" != "true" && "$HIDE_DONE" != "true" ]]; then
+      clauses+=("$(jql_unassigned_or_failed_qa)")
+    fi
+
+    if [[ "$HIDE_DONE" == "true" ]]; then
+      clauses+=("$(jql_hide_done_clause)")
+    fi
+  fi
+
+  if [[ "$NO_ASSIGNEE" == "true" ]]; then
+    clauses+=("assignee is EMPTY")
+  fi
+
+  if [[ "$MY_TASK" == "true" ]]; then
+    clauses+=("assignee = currentUser()")
+  fi
+
+  # Filter out non-dev ticket types
+  if [[ "$FOR_DEV" == "true" ]]; then
+    clauses+=('type not in ("Operations", "Test Report", "Release Procedure", "Translation Update")')
+  fi
+
+  if [[ ${#STATUSES[@]} -gt 0 ]]; then
+    local quoted_statuses=()
+
+    for s in "${STATUSES[@]}"; do
+      quoted_statuses+=("\"$s\"")
+    done
+
+    local joined
+    joined=$(IFS=,; echo "${quoted_statuses[*]}")
+
+    clauses+=("status IN (${joined})")
+  fi
+
+  if [[ ${#TYPES[@]} -gt 0 ]]; then
+    local quoted_types=()
+
+    for s in "${TYPES[@]}"; do
+      quoted_types+=("\"$s\"")
+    done
+
+    local joined
+    joined=$(IFS=,; echo "${quoted_types[*]}")
+
+    clauses+=("type IN (${joined})")
+  fi
+
+  local jql=''
+
+  for clause in "${clauses[@]}"; do
+    if [[ -n "$jql" ]]; then
+      jql+=' AND '
+    fi
+
+    jql+="$clause"
+  done
+
+  jql+=' ORDER BY created ASC'
+
+  echo "$jql"
+}
+
+build_jql "$@"

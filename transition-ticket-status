@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# transition-ticket-status: Move Jira ticket to target status
+# Usage:
+#   transition-ticket-status CW-123 "PR Open"
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+R='\033[0;31m'      # Red
+O='\033[38;5;208m'  # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+error()  { echo -e "${R}✖${NC} $*"; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+warn() { echo -e "${O}▲${NC} $*"; }
+
+transition_to() {
+  local ticket_key="$1"
+  local status="$2"
+
+  info "Transitioning '$ticket_key' → '$status'..."
+
+  acli jira workitem transition \
+    --key "$ticket_key" \
+    --status "$status" \
+    --yes &>/dev/null \
+    && ok "Status → $status" \
+    || {
+      warn "Could not transition to '$status'"
+      return 1
+    }
+}
+
+[[ $# -lt 2 ]] && {
+  echo "Usage: transition-ticket-status CW-123 \"In Progress\""
+  exit 1
+}
+
+transition_to "$1" "$2"

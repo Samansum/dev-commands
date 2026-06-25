@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+C='\033[0;36m'
+R='\033[0;31m'
+NC='\033[0m'
+
+info() { echo -e "${C}▶${NC} $*"; }
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+
+GIT_DIR=$(git rev-parse --absolute-git-dir 2>/dev/null) \
+  || die "Not inside a git repository."
+
+CW_DIR="$GIT_DIR/cw"
+CONFIG_FILE="$CW_DIR/base-branch"
+
+mkdir -p "$CW_DIR"
+
+case "${1:-}" in
+  "")
+    [[ -f "$CONFIG_FILE" ]] \
+      || die "No base branch configured."
+
+    cat "$CONFIG_FILE"
+    ;;
+
+  --clear)
+    rm -f "$CONFIG_FILE"
+    info "Base branch cleared."
+    ;;
+
+  -h|--help)
+    cat <<EOF
+Usage:
+  base-branch              Show configured base branch
+  base-branch <branch>     Set base branch
+  base-branch --clear      Clear base branch
+EOF
+    ;;
+
+  *)
+    echo "$1" > "$CONFIG_FILE"
+    info "Base branch set to: $1"
+    ;;
+esac

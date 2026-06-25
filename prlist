@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# prlist: List all open PRs for a base branch
+# Usage: prlist [--base <branch>]
+
+set -eo pipefail
+
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+R='\033[0;31m'      # Red
+O='\033[38;5;208m'  # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+error()  { echo -e "${R}✖${NC} $*"; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+warn() { echo -e "${O}▲${NC} $*"; }
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+BASE_BRANCH=""
+PROVIDED_BRANCH=""
+ALL=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base|-b)
+      [[ $# -ge 2 ]] || die "--base requires a branch name"
+      PROVIDED_BRANCH="$2"
+      BASE_BRANCH="$2"
+      shift 2
+      ;;
+    --all|-a)
+      ALL=true
+      shift
+      ;;
+    *)
+      die "Unknown argument: $1. Usage: prlist [--base <branch>] [--all]"
+      ;;
+  esac
+done
+
+# Use configured base branch unless:
+#   - user explicitly provided --base
+#   - user specified --all
+if [[ -z "$BASE_BRANCH" && "$ALL" == false ]]; then
+  BASE_BRANCH="$(base-branch)"
+fi
+
+
+# ── Fetch upstream repo ───────────────────────────────────────────────────────
+UPSTREAM_REPO=$(git remote get-url upstream 2>/dev/null \
+  | sed 's|.*github.com[:/]||;s|.git$||') || true
+
+[[ -z "$UPSTREAM_REPO" ]] \
+  && die "No upstream remote found. Are you in the right repo?"
+
+# ── Fetch PRs ─────────────────────────────────────────────────────────────────
+if [[ -n "$BASE_BRANCH" ]]; then
+  info "Fetching open PRs targeting ${BASE_BRANCH} from ${UPSTREAM_REPO}..."
+  PRS_JSON=$(gh pr list \
+    --repo "$UPSTREAM_REPO" \
+    --state open \
+    --base "$BASE_BRANCH" \
+    --json number,title,author,labels,updatedAt,reviewDecision,url,headRefName,isDraft,reviews \
+    --limit 100 2>/dev/null) || die "Failed to fetch PRs."
+else
+  info "Fetching all open PRs from ${UPSTREAM_REPO}..."
+  PRS_JSON=$(gh pr list \
+    --repo "$UPSTREAM_REPO" \
+    --state open \
+    --json number,title,author,labels,updatedAt,reviewDecision,url,headRefName,baseRefName,isDraft,reviews \
+    --limit 100 2>/dev/null) || die "Failed to fetch PRs."
+fi
+
+TOTAL=$(echo "$PRS_JSON" | python3 -c "
+import sys, json
+prs = json.load(sys.stdin)
+prs = [pr for pr in prs if not pr.get('isDraft', False)]
+print(len(prs))
+")
+
+echo ""
+if [[ -n "$BASE_BRANCH" ]]; then
+  echo -e "${W}Open PRs → ${C}${BASE_BRANCH}${W} (${TOTAL})${NC}"
+else
+  echo -e "${W}All Open PRs (${TOTAL})${NC}"
+fi
+echo -e "${D}$(printf '─%.0s' {1..60})${NC}"
+
+if [[ "$TOTAL" == "0" ]]; then
+  CMD_PARAM=""
+
+  if [[ -n "$PROVIDED_BRANCH" ]]; then
+    CMD_PARAM=" --base $PROVIDED_BRANCH"
+  fi
+
+  echo -e "  ${D}no open PRs found${NC}"
+  echo ""
+  echo -e "  [r: prlist${CMD_PARAM}]  ·  [r: prlist -a]  ·  [r: subtasks]"
+  exit 0
+fi
+
+# ── Fetch mergeable status for each PR in parallel ───────────────────────────
+info "Checking merge conflict status..."
+
+PR_NUMBERS=$(echo "$PRS_JSON" | python3 -c "
+import sys, json
+prs = [pr for pr in json.load(sys.stdin) if not pr.get('isDraft', False)]
+print(' '.join(str(pr['number']) for pr in prs))
+")
+
+MERGEABLE_JSON="{}"
+if [[ -n "$PR_NUMBERS" ]]; then
+  # Fetch all PRs in parallel, collect into a number→mergeable map
+  MERGEABLE_JSON=$(
+    echo "$PR_NUMBERS" \
+    | tr ' ' '\n' \
+    | xargs -P 8 -I{} sh -c \
+        "gh pr view {} --repo \"$UPSTREAM_REPO\" --json number,mergeable 2>/dev/null || echo '{\"number\":{},\"mergeable\":\"UNKNOWN\"}'" \
+    | python3 -c "
+import sys, json
+result = {}
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+        result[str(obj['number'])] = obj.get('mergeable', 'UNKNOWN')
+    except:
+        pass
+print(json.dumps(result))
+"
+  )
+fi
+
+# ── Print each PR via Python (avoids tab-splitting bugs) ─────────────────────
+SHOW_BASE="$([[ -z "$BASE_BRANCH" ]] && echo 1 || echo 0)"
+
+GH_USER=$(gh api user --jq '.login' 2>/dev/null) \
+  || die "Failed to get GitHub user. Is 'gh' authenticated?"
+
+echo "$PRS_JSON" | python3 -c "
+import sys, json, datetime
+
+# ANSI colors
+R  = '\033[0;31m'      # Red
+O  = '\033[38;5;208m'  # Orange
+Y  = '\033[0;33m'      # Yellow
+G  = '\033[0;32m'      # Green
+B  = '\033[0;34m'      # Blue
+W  = '\033[1;37m'      # Bright White
+D  = '\033[0;90m'      # Dark Gray
+C  = '\033[0;36m'      # Cyan
+M  = '\033[0;35m'      # Magenta
+NC = '\033[0m'         # Reset / No Color
+
+show_base    = sys.argv[1] == '1'
+mergeable    = json.loads(sys.argv[2])   # { 'number': 'MERGEABLE'|'CONFLICTING'|'UNKNOWN' }
+prs          = json.load(sys.stdin)
+prs          = [pr for pr in prs if not pr.get('isDraft', False)]
+now          = datetime.datetime.now(datetime.timezone.utc)
+
+def time_ago(iso):
+    dt   = datetime.datetime.fromisoformat(iso.replace('Z', '+00:00'))
+    diff = now - dt
+    h    = diff.days * 24 + diff.seconds // 3600
+    m    = diff.seconds % 3600 // 60
+
+    if diff.days > 0: return f'{diff.days}d ago'
+    if h > 0:         return f'{h}h ago'
+    if m > 0:         return f'{m}m ago'
+    return 'just now'
+
+def hex_to_rgb(hex_color):
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def color_label(name, hex_color):
+    try:
+        r, g, b = hex_to_rgb(hex_color)
+        return f'\033[38;2;{r};{g};{b}m{name}{NC}'
+    except:
+        return name
+
+def review_badge(approved_by, changes_requested_by, commented_by):
+    parts = []
+
+    if approved_by:
+        parts.append(
+            f'{G}approved{NC} {D}by {\", \".join(approved_by)}{NC}'
+        )
+
+    if changes_requested_by:
+        parts.append(
+            f'{O}changes requested{NC} {D}by {\", \".join(changes_requested_by)}{NC}'
+        )
+
+    if commented_by:
+        parts.append(
+            f'{B}commented{NC} {D}by {\", \".join(commented_by)}{NC}'
+        )
+
+    if not parts:
+        return f'{D}awaiting review{NC}'
+
+    return f'{D} · {NC}'.join(parts)
+
+def conflict_badge(number):
+    state = mergeable.get(str(number), 'UNKNOWN')
+    if state == 'CONFLICTING':
+        return f' {R}⚠ conflict{NC}'
+    if state == 'MERGEABLE':
+        return '' #f' {G}✓ mergeable{NC}'
+    return f' {D}? merge unknown{NC}'
+
+for pr in prs:
+    number   = pr['number']
+    title    = pr['title']
+    author   = pr['author']['login']
+    updated  = time_ago(pr['updatedAt'])
+    decision = pr.get('reviewDecision') or ''
+    url      = pr['url']
+    head     = pr['headRefName']
+    base     = pr.get('baseRefName', '')
+    is_author = '$GH_USER' == author
+
+    # Latest review state per reviewer
+    latest_reviews = {}
+
+    for r in pr.get('reviews', []):
+        review_author = (r.get('author') or {}).get('login')
+        state = r.get('state')
+
+        if review_author:
+            latest_reviews[review_author] = state
+
+    approved_by = sorted([
+        user for user, state in latest_reviews.items()
+        if state == 'APPROVED'
+    ])
+
+    changes_requested_by = sorted([
+        user for user, state in latest_reviews.items()
+        if state == 'CHANGES_REQUESTED'
+    ])
+
+    commented_by = sorted([
+        user for user, state in latest_reviews.items()
+        if state == 'COMMENTED' and user != author
+    ])
+
+    # Labels with GitHub colors
+    labels = ', '.join(
+        color_label(l['name'], l.get('color', '999999'))
+        for l in pr.get('labels', [])
+    )
+
+    label_str    = f'  {M}({labels}){NC}' if labels else ''
+    base_str     = f'  {D}→ {base}{NC}' if show_base and base else ''
+    badge        = review_badge(approved_by, changes_requested_by, commented_by)
+    conflict     = conflict_badge(number)
+
+    approve_pr_action     = '' if is_author else f'[r: approve-pr {number}] · '
+    merge_action          = f'[r: merge-pr {number}]'
+    approve_merge_action  = '' if is_author else f' · [r: merge-pr {number} --approve]'
+    update_pr_action      = f' · [r: update-pr] · [r: checkout {head}] · [r: rebase {head}]' if is_author else ''
+    view_pr_action        = f' · [r: view-pr {number}]'
+
+    author_log = (
+        f'{G}{author}{NC}'
+        if is_author
+        else f'{C}{author}{NC}'
+    )
+
+    print('')
+    print(f'  {W}#{number}{NC} {title}{label_str}')
+    print(f'  {D}  {head}{base_str}{NC} {D}by {NC}{author_log}{D} · updated {updated} · {NC}{badge}{conflict}')
+    print(f'  {D}  {approve_pr_action}{merge_action}{approve_merge_action}{update_pr_action}{view_pr_action}{NC}')
+
+" "$SHOW_BASE" "$MERGEABLE_JSON"
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${D}$(printf '─%.0s' {1..60})${NC}"
+echo "$PRS_JSON" | python3 -c "
+import sys, json
+prs      = [pr for pr in json.load(sys.stdin) if not pr.get('isDraft', False)]
+approved = changes = awaiting = 0
+for pr in prs:
+    d = pr.get('reviewDecision') or ''
+    if d == 'APPROVED':            approved += 1
+    elif d == 'CHANGES_REQUESTED': changes  += 1
+    else:                          awaiting += 1
+
+sep = f'$D  ·  $NC'
+parts = []
+command_params    = f' --base $PROVIDED_BRANCH' if '$PROVIDED_BRANCH' else ''
+if approved: parts.append(('$G', f'approved: {approved}'))
+if changes:  parts.append(('$O', f'changes requested: {changes}'))
+if awaiting: parts.append(('$D', f'awaiting review: {awaiting}'))
+print(sep.join(f'{c}{t}$NC' for c, t in parts))
+print('')
+print(f'[r: prlist{command_params}]  ·  [r: prlist -a]  ·  [r: subtasks]')
+"

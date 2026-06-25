@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# sync-stack-con: Continue a sync-stack that was interrupted by a conflict
+# Usage: sync-stack-con
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+die()  { echo "❌ $*" >&2; exit 1; }
+info() { echo "ℹ️  $*"; }
+ok()   { echo "✅ $*"; }
+
+PROGRESS_FILE="$HOME/.sync-stack-progress"
+
+# ── Check progress file exists ────────────────────────────────────────────────
+[[ ! -f "$PROGRESS_FILE" ]] \
+  && die "No interrupted sync-stack found. Run sync-stack to start."
+
+# ── Read progress ─────────────────────────────────────────────────────────────
+PROGRESS=$(cat "$PROGRESS_FILE")
+BASE_BRANCH=$(echo "$PROGRESS" | cut -d'|' -f1)
+ORIGIN_BRANCH=$(echo "$PROGRESS" | cut -d'|' -f2)
+REMAINING_RAW=$(echo "$PROGRESS" | cut -d'|' -f3)
+
+IFS=':' read -ra REMAINING <<< "$REMAINING_RAW"
+
+[[ ${#REMAINING[@]} -eq 0 ]] && die "Progress file is empty or corrupted: $PROGRESS_FILE"
+
+# ── Guard: make sure rebase is not still in progress ─────────────────────────
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) \
+  || die "Not inside a git repository."
+
+if [[ -d "$REPO_ROOT/.git/rebase-merge" || -d "$REPO_ROOT/.git/rebase-apply" ]]; then
+  die "Rebase still in progress. Resolve conflicts and run: git rebase --continue — then re-run sync-stack-con"
+fi
+
+echo ""
+info "Resuming sync-stack..."
+info "Remaining branches: ${REMAINING[*]}"
+echo ""
+
+# ── Rebase + push function ────────────────────────────────────────────────────
+do_rebase_and_push() {
+  local branch="$1"
+  local parent="$2"
+
+  info "Checking out $branch..."
+  git checkout "$branch" --quiet
+
+  if [[ ! "$parent" =~ ^[A-Z]+-[0-9]+$ ]]; then
+    info "Rebasing $branch onto upstream/$parent..."
+    git fetch upstream "$parent" --quiet
+    git rebase "upstream/$parent"
+  else
+    info "Rebasing $branch onto origin/$parent..."
+    git fetch origin "$parent" --quiet
+    git rebase "origin/$parent"
+  fi
+
+  info "Force pushing $branch to origin..."
+  git push --force-with-lease origin "$branch" --quiet
+
+  ok "$branch — rebased & force pushed."
+}
+
+# ── The first branch in REMAINING had the conflict and user already ran
+#    git rebase --continue — so just force push it, then continue the rest ────
+CONFLICT_BRANCH="${REMAINING[0]}"
+
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [[ "$CURRENT_BRANCH" != "$CONFLICT_BRANCH" ]]; then
+  info "Checking out $CONFLICT_BRANCH..."
+  git checkout "$CONFLICT_BRANCH" --quiet
+fi
+
+info "Force pushing resolved branch $CONFLICT_BRANCH to origin..."
+git push --force-with-lease origin "$CONFLICT_BRANCH" --quiet
+ok "$CONFLICT_BRANCH — rebased & force pushed."
+
+# ── Continue with remaining branches ─────────────────────────────────────────
+for i in "${!REMAINING[@]}"; do
+  [[ $i -eq 0 ]] && continue  # already handled above
+
+  BRANCH="${REMAINING[$i]}"
+  PARENT="${REMAINING[$((i-1))]}"
+
+  # Save updated progress
+  STILL_REMAINING=("${REMAINING[@]:$i}")
+  echo "$BASE_BRANCH|$ORIGIN_BRANCH|$(IFS=:; echo "${STILL_REMAINING[*]}")" > "$PROGRESS_FILE"
+
+  if ! do_rebase_and_push "$BRANCH" "$PARENT"; then
+    echo ""
+    echo "⚠️  Conflict detected on branch: $BRANCH"
+    echo "   Resolve the conflicts, then run: git rebase --continue"
+    echo "   Once done, run: sync-stack-con"
+    echo ""
+    exit 1
+  fi
+done
+
+# ── All done ──────────────────────────────────────────────────────────────────
+info "Returning to original branch: $ORIGIN_BRANCH..."
+git checkout "$ORIGIN_BRANCH" --quiet
+rm -f "$PROGRESS_FILE"
+
+echo ""
+ok "Stack sync complete! All branches are up to date."

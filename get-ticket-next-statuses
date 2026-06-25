@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# get-ticket-next-statuses: Print Jira ticket next statuses
+# Usage:
+#   get-ticket-next-statuses CW-123
+
+jira-transitions() {
+  local ISSUE="$1"
+
+  if [[ -z "$ISSUE" ]]; then
+    echo "Usage: jira-transitions <ISSUE-KEY>"
+    echo "Example: jira-transitions CW-36988"
+    return 1
+  fi
+
+  if [[ -z "$JIRA_EMAIL" || -z "$JIRA_API_TOKEN" || -z "$JIRA_BASE_URL" ]]; then
+    echo "Error: Missing required environment variables."
+    echo "Please set: JIRA_EMAIL, JIRA_API_TOKEN, JIRA_BASE_URL"
+    return 1
+  fi
+
+  curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+    "$JIRA_BASE_URL/rest/api/3/issue/$ISSUE/transitions" \
+    | jq -r '.transitions[].name'
+}
+
+jira-transitions "$@"

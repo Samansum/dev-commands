@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# sync-stack: Rebase entire branch stack bottom-up from base branch to current branch
+# Usage: sync-stack
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+die()  { echo "❌ $*" >&2; exit 1; }
+info() { echo "ℹ️  $*"; }
+ok()   { echo "✅ $*"; }
+
+PROGRESS_FILE="$HOME/.sync-stack-progress"
+
+# ── Guard: don't run if a previous sync is incomplete ────────────────────────
+if [[ -f "$PROGRESS_FILE" ]]; then
+  die "A previous sync-stack was interrupted. Resolve conflicts then run: sync-stack-con"
+fi
+
+# ── Get current branch ────────────────────────────────────────────────────────
+ORIGIN_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) \
+  || die "Not inside a git repository."
+
+[[ "$ORIGIN_BRANCH" == "HEAD" ]] && die "Detached HEAD state. Check out a branch first."
+
+# ── Build commit hash -> branch map ──────────────────────────────────────────
+declare -A BRANCH_TIP_MAP
+
+while IFS= read -r line; do
+  hash=$(echo "$line" | awk '{print $1}')
+  ref=$(echo "$line" | awk '{print $2}')
+  branch_name=$(echo "$ref" | sed 's|refs/remotes/origin/||;s|refs/remotes/upstream/||;s|refs/heads/||')
+  BRANCH_TIP_MAP["$hash"]="$branch_name"
+done < <(git for-each-ref --format='%(objectname) %(refname)' refs/heads refs/remotes/origin refs/remotes/upstream 2>/dev/null)
+
+# ── Walk up the stack to build chain ─────────────────────────────────────────
+STACK=("$ORIGIN_BRANCH")
+SEARCH_BRANCH="$ORIGIN_BRANCH"
+
+while true; do
+  PARENT=""
+  while IFS= read -r commit_hash; do
+    if [[ -n "${BRANCH_TIP_MAP[$commit_hash]+_}" ]]; then
+      CANDIDATE="${BRANCH_TIP_MAP[$commit_hash]}"
+      if [[ "$CANDIDATE" != "$SEARCH_BRANCH" ]]; then
+        PARENT="$CANDIDATE"
+        break
+      fi
+    fi
+  done < <(git log --pretty=format:'%H' "$SEARCH_BRANCH" 2>/dev/null | tail -n +2)
+
+  [[ -z "$PARENT" ]] && break
+  STACK=("$PARENT" "${STACK[@]}")
+  SEARCH_BRANCH="$PARENT"
+
+  # Stop at non-Jira base branch
+  if [[ ! "$PARENT" =~ ^[A-Z]+-[0-9]+$ ]]; then
+    break
+  fi
+done
+
+# ── Validate stack ────────────────────────────────────────────────────────────
+[[ ${#STACK[@]} -lt 2 ]] && die "Could not detect a stack. Make sure you are on a Jira ticket branch."
+
+# ── Print detected stack ──────────────────────────────────────────────────────
+echo ""
+echo "🔗 Detected stack (will rebase in this order):"
+for i in "${!STACK[@]}"; do
+  BR="${STACK[$i]}"
+  [[ $i -eq 0 ]] && echo "  📦 $BR (base)" && continue
+  echo "  🔀 $BR"
+done
+echo ""
+
+BASE_BRANCH="${STACK[0]}"
+REBASE_BRANCHES=("${STACK[@]:1}")
+
+# ── Save progress file ────────────────────────────────────────────────────────
+save_progress() {
+  local remaining=("$@")
+  echo "$BASE_BRANCH|$ORIGIN_BRANCH|$(IFS=:; echo "${remaining[*]}")" > "$PROGRESS_FILE"
+}
+
+# ── Rebase + push function ────────────────────────────────────────────────────
+do_rebase_and_push() {
+  local branch="$1"
+  local parent="$2"
+
+  info "Checking out $branch..."
+  git checkout "$branch" --quiet
+
+  if [[ ! "$parent" =~ ^[A-Z]+-[0-9]+$ ]]; then
+    info "Rebasing $branch onto upstream/$parent..."
+    git fetch upstream "$parent" --quiet
+    git rebase "upstream/$parent"
+  else
+    info "Rebasing $branch onto origin/$parent..."
+    git fetch origin "$parent" --quiet
+    git rebase "origin/$parent"
+  fi
+
+  info "Force pushing $branch to origin..."
+  git push --force-with-lease origin "$branch" --quiet
+
+  ok "$branch — rebased & force pushed."
+}
+
+# ── Run rebases ───────────────────────────────────────────────────────────────
+for i in "${!REBASE_BRANCHES[@]}"; do
+  BRANCH="${REBASE_BRANCHES[$i]}"
+  PARENT=$([[ $i -eq 0 ]] && echo "$BASE_BRANCH" || echo "${REBASE_BRANCHES[$((i-1))]}")
+
+  save_progress "${REBASE_BRANCHES[@]:$i}"
+
+  if ! do_rebase_and_push "$BRANCH" "$PARENT"; then
+    echo ""
+    echo "⚠️  Conflict detected on branch: $BRANCH"
+    echo "   Resolve the conflicts, then run: git rebase --continue"
+    echo "   Once done, run: sync-stack-con"
+    echo ""
+    exit 1
+  fi
+done
+
+# ── All done ──────────────────────────────────────────────────────────────────
+info "Returning to original branch: $ORIGIN_BRANCH..."
+git checkout "$ORIGIN_BRANCH" --quiet
+rm -f "$PROGRESS_FILE"
+
+echo ""
+ok "Stack sync complete! All branches are up to date."

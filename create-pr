@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# create-pr: Creates a GitHub PR using the current branch as a Jira ticket key
+# Usage: create-pr [--draft] [--base <branch>]
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+R='\033[0;31m'      # Red
+O='\033[38;5;208m' # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+error()  { echo -e "${R}✖${NC} $*"; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+warn() { echo -e "${O}▲${NC} $*"; }
+
+# ── Parse optional flags ──────────────────────────────────────────────────────
+DRAFT_FLAG=""
+BASE_BRANCH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --draft) DRAFT_FLAG="--draft"; shift ;;
+    --base)  BASE_BRANCH="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: create-pr [--draft] [--base <branch>]"
+      echo "  --draft          Open PR as a draft"
+      echo "  --base <branch>  Target base branch (default: repo default branch)"
+      exit 0 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+
+# ── Get base branch ───────────────────────────────────────────────────────────
+[[ -z "${BASE_BRANCH:-}" ]] && BASE_BRANCH="$(base-branch)"
+
+
+# ── Get current branch ────────────────────────────────────────────────────────
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) \
+  || die "Not inside a git repository."
+
+[[ "$BRANCH" == "HEAD" ]] && die "You are in a detached HEAD state. Check out a branch first."
+
+# ── Validate branch looks like a Jira ticket key (e.g. CW-123 or CW-123-2) ───
+if [[ ! "$BRANCH" =~ ^[A-Z]+-[0-9]+(-[0-9]+)?$ ]]; then
+  die "Branch name '$BRANCH' doesn't look like a Jira ticket key (e.g. CW-123 or CW-123-2)."
+fi
+
+# Strip trailing -<number> suffix to get the canonical Jira ticket key
+TICKET_KEY=$(echo "$BRANCH" | sed 's/-[0-9]*$//')
+# Re-validate: if stripping went too far (e.g. removed the issue number), restore original
+if [[ ! "$TICKET_KEY" =~ ^[A-Z]+-[0-9]+$ ]]; then
+  TICKET_KEY="$BRANCH"
+fi
+
+info "Branch: $BRANCH"
+info "Ticket key: $TICKET_KEY"
+
+# ── Fetch Jira ticket summary via acli ───────────────────────────────────────
+info "Fetching Jira ticket summary..."
+
+JSON_OUTPUT=$(acli jira workitem view "$TICKET_KEY" --fields summary --json 2>/dev/null) \
+  || die "Failed to fetch Jira ticket '$TICKET_KEY'. Is acli authenticated? Run: acli jira auth login --web"
+
+SUMMARY=$(echo "$JSON_OUTPUT" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+if isinstance(data, list):
+    print(data[0]['fields']['summary'])
+else:
+    print(data['fields']['summary'])
+" 2>/dev/null) || die "Failed to parse summary from acli output. Raw output: $JSON_OUTPUT"
+
+SUMMARY=$(echo "$SUMMARY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+[[ -z "$SUMMARY" ]] && die "Jira ticket '$TICKET_KEY' returned an empty summary."
+
+# ── Detect parent branch ──────────────────────────────────────────────────────
+PARENT_BRANCH=""
+PARENT_PR_REF=""
+
+declare -A BRANCH_TIP_MAP
+
+while IFS= read -r line; do
+  hash=$(echo "$line" | awk '{print $1}')
+  ref=$(echo "$line" | awk '{print $2}')
+  branch_name=$(echo "$ref" | sed 's|refs/remotes/origin/||;s|refs/heads/||')
+
+  if [[ "$branch_name" =~ ^[A-Z]+-[0-9]+(-[0-9]+)?$ ]] && [[ "$branch_name" != "$BRANCH" ]]; then
+    BRANCH_TIP_MAP["$hash"]="$branch_name"
+  fi
+done < <(git for-each-ref --format='%(objectname) %(refname)' refs/heads refs/remotes/origin 2>/dev/null)
+
+while IFS= read -r commit_hash; do
+  if [[ -n "${BRANCH_TIP_MAP[$commit_hash]+_}" ]]; then
+    PARENT_BRANCH="${BRANCH_TIP_MAP[$commit_hash]}"
+    break
+  fi
+done < <(git log --pretty=format:'%H' HEAD 2>/dev/null | tail -n +2)
+
+# ── Look up parent PR number via gh ──────────────────────────────────────────
+if [[ -n "$PARENT_BRANCH" ]]; then
+  info "Detected parent branch: $PARENT_BRANCH — looking up PR..."
+  PARENT_PR_NUMBER=$(gh pr list --head "$PARENT_BRANCH" --json number --jq '.[0].number' 2>/dev/null) || true
+
+  if [[ -n "$PARENT_PR_NUMBER" && "$PARENT_PR_NUMBER" != "null" ]]; then
+    PARENT_PR_REF="#${PARENT_PR_NUMBER}"
+    info "Parent PR: $PARENT_PR_REF"
+  else
+    info "No open PR found for parent branch '$PARENT_BRANCH' — skipping dependency line."
+  fi
+fi
+
+# ── Check clipboard for image (Ubuntu: xclip) ────────────────────────────────
+CLIPBOARD_IMAGE_MARKDOWN=""
+
+if command -v xclip &>/dev/null; then
+  CLIP_TYPE=$(xclip -selection clipboard -t TARGETS -o 2>/dev/null || true)
+
+  if echo "$CLIP_TYPE" | grep -q "image/png"; then
+    if [[ -z "${GH_SESSION_TOKEN:-}" ]]; then
+      info "Image detected in clipboard but GH_SESSION_TOKEN is not set — skipping."
+      info "To enable image upload: get your 'user_session' cookie from Firefox (F12 → Storage → Cookies → github.com) and add to ~/.zshrc: export GH_SESSION_TOKEN=\"your-token\""
+    else
+      info "Image detected in clipboard — uploading to GitHub..."
+      TMP_IMAGE=$(mktemp /tmp/clipboard-XXXXXX.png)
+
+      if xclip -selection clipboard -t image/png -o > "$TMP_IMAGE" 2>/dev/null; then
+        GH_IMAGE_OUTPUT=$(gh image "$TMP_IMAGE" 2>/dev/null) || true
+
+        if [[ -n "$GH_IMAGE_OUTPUT" ]]; then
+          IMAGE_URL=$(echo "$GH_IMAGE_OUTPUT" | grep -oP '(?<=\()https://github\.com/user-attachments/assets/[^)]+')
+          if [[ -n "$IMAGE_URL" ]]; then
+            IMG_WIDTH=$(python3 -c "from PIL import Image; img=Image.open('$TMP_IMAGE'); print(img.size[0])" 2>/dev/null || echo "")
+            IMG_HEIGHT=$(python3 -c "from PIL import Image; img=Image.open('$TMP_IMAGE'); print(img.size[1])" 2>/dev/null || echo "")
+            if [[ -n "$IMG_WIDTH" && -n "$IMG_HEIGHT" ]]; then
+              CLIPBOARD_IMAGE_MARKDOWN="<img width=\"$IMG_WIDTH\" height=\"$IMG_HEIGHT\" alt=\"image\" src=\"$IMAGE_URL\" />"
+            else
+              CLIPBOARD_IMAGE_MARKDOWN="<img alt=\"image\" src=\"$IMAGE_URL\" />"
+            fi
+            info "Image uploaded successfully."
+          else
+            info "Image upload failed — could not extract URL."
+          fi
+        else
+          info "Image upload failed — skipping."
+        fi
+      fi
+
+      rm -f "$TMP_IMAGE"
+    fi
+  fi
+else
+  info "xclip not found — skipping clipboard image check. Install with: sudo apt install xclip"
+fi
+
+# ── Build PR title ────────────────────────────────────────────────────────────
+PR_TITLE="${TICKET_KEY}: ${SUMMARY}"
+info "PR title: \"$PR_TITLE\""
+
+# ── Build PR body ─────────────────────────────────────────────────────────────
+JIRA_URL="https://khalibre.atlassian.net/browse/${TICKET_KEY}"
+
+PR_BODY=""
+[[ -n "$PARENT_PR_REF" ]]            && PR_BODY+="### DEPEND ON ${PARENT_PR_REF}"$'\n'
+PR_BODY+="${JIRA_URL}"
+[[ -n "$CLIPBOARD_IMAGE_MARKDOWN" ]] && PR_BODY+=$'\n'"${CLIPBOARD_IMAGE_MARKDOWN}"
+
+# ── Push branch if it has no upstream ────────────────────────────────────────
+if ! git rev-parse --abbrev-ref "@{upstream}" &>/dev/null; then
+  info "No upstream found — pushing branch to origin..."
+  git push --set-upstream origin "$BRANCH"
+fi
+
+# ── Build gh pr create command ────────────────────────────────────────────────
+GH_ARGS=(--title "$PR_TITLE" --body "$PR_BODY")
+
+[[ -n "$DRAFT_FLAG" ]]  && GH_ARGS+=("$DRAFT_FLAG")
+[[ -n "$BASE_BRANCH" ]] && GH_ARGS+=(--base "$BASE_BRANCH")
+
+# ── Create the PR ─────────────────────────────────────────────────────────────
+echo ""
+info "Creating PR..."
+gh pr create "${GH_ARGS[@]}"
+
+# ── Update ticket status to PR Open ────────────────────────────────────────────
+transition-ticket-status "$TICKET_KEY" "PR Open"
+
+echo ""
+echo "── Actions ──────────────────────────────────────────────────────────────────"
+echo -e "${D}[r: subtasks]  ·  [r: prlist]  ·  [r: update-pr --set-img]  ·  [r: update-pr]${NC}"

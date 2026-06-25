@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# merge-pr: Rebase-merge a PR, bypassing branch protection rules
+# Usage: merge-pr <pr-number> [--approve]
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+R='\033[0;31m'      # Red
+O='\033[38;5;208m' # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+error()  { echo -e "${R}✖${NC} $*"; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+warn() { echo -e "${O}▲${NC} $*"; }
+
+# ── Parse arguments ───────────────────────────────────────────────────────────
+PR_NUMBER=""
+APPROVE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --approve) APPROVE=true; shift ;;
+    -h|--help)
+      echo "Usage: merge-pr <pr-number> [--approve]"
+      echo "  --approve    Approve the PR with your user before merging"
+      exit 0 ;;
+    -*)
+      die "Unknown flag: $1" ;;
+    *)
+      [[ -n "$PR_NUMBER" ]] && die "Unexpected argument: $1"
+      PR_NUMBER="$1"
+      shift ;;
+  esac
+done
+
+[[ -z "$PR_NUMBER" ]] && die "Usage: merge-pr <pr-number> [--approve]"
+[[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]] && die "PR number must be numeric."
+
+# ── Approve if requested ──────────────────────────────────────────────────────
+if [[ "$APPROVE" == "true" ]]; then
+  approve-pr "$PR_NUMBER"
+fi
+
+# ── Rebase merge with admin bypass ───────────────────────────────────────────
+info "Merging PR #${PR_NUMBER} (rebase, bypass rules)..."
+gh pr merge "$PR_NUMBER" --rebase --admin \
+  || die "Failed to merge PR #${PR_NUMBER}."
+
+#ok "PR #${PR_NUMBER} merged." # gh already has success log

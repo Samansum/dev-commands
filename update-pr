@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# update-pr: Update current PR description, auto-handle dependency + clipboard image
+#   - Auto-removes "DEPEND ON #xxx" line if parent PR is merged
+#   - Auto-appends clipboard image if present
+#   - --set-img: replace all images with clipboard image
+# Usage: update-pr [--set-img]
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+R='\033[0;31m'
+O='\033[38;5;208m'
+G='\033[0;32m'
+C='\033[0;36m'
+D='\033[0;90m'
+NC='\033[0m'
+
+die() { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+error() { echo -e "${R}✖${NC} $*" >&2; }
+
+# ── Clipboard helpers ────────────────────────────────────────────────────────
+clipboard_has_image() {
+  command -v xclip >/dev/null 2>&1 || return 1
+  xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -q "image/png"
+}
+
+upload_clipboard_image() {
+  command -v xclip >/dev/null 2>&1 || {
+    error "xclip not found"; return 1
+  }
+
+  [[ -z "${GH_SESSION_TOKEN:-}" ]] && {
+    error "GH_SESSION_TOKEN not set"; return 1
+  }
+
+  CLIP_TYPE=$(xclip -selection clipboard -t TARGETS -o 2>/dev/null || true)
+  echo "$CLIP_TYPE" | grep -q "image/png" || {
+    error "No image in clipboard"; return 1
+  }
+
+  TMP_IMAGE=$(mktemp /tmp/clipboard-XXXXXX.png)
+
+  xclip -selection clipboard -t image/png -o > "$TMP_IMAGE" 2>/dev/null \
+    || { error "Failed to read clipboard image"; rm -f "$TMP_IMAGE"; return 1; }
+
+  info "Uploading image..." >&2
+  GH_IMAGE_OUTPUT=$(gh image "$TMP_IMAGE" 2>/dev/null) || true
+
+  rm -f "$TMP_IMAGE"
+
+  IMAGE_URL=$(echo "$GH_IMAGE_OUTPUT" | grep -oP '(?<=\()https://github\.com/user-attachments/assets/[^)]+')
+
+  [[ -z "$IMAGE_URL" ]] && {
+    error "Upload failed"; return 1
+  }
+
+  echo "<img alt=\"image\" src=\"$IMAGE_URL\" />"
+}
+
+# ── Flags ────────────────────────────────────────────────────────────────────
+REP_IMG=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --set-img) REP_IMG=true; shift ;;
+    -h|--help)
+      echo "Usage: update-pr [--set-img]"
+      exit 0
+      ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+# ── Git context ──────────────────────────────────────────────────────────────
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) \
+  || die "Not in git repo"
+
+[[ "$BRANCH" == "HEAD" ]] && die "Detached HEAD"
+
+# ── PR fetch ────────────────────────────────────────────────────────────────
+info "Fetching PR..."
+
+PR_JSON=$(gh pr view --json number,body 2>/dev/null) \
+  || die "No open PR for branch"
+
+PR_NUMBER=$(echo "$PR_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['number'])")
+PR_BODY=$(echo "$PR_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['body'])")
+
+info "PR #$PR_NUMBER found"
+
+NEW_BODY="$PR_BODY"
+
+# ── 1. Dependency cleanup (ALWAYS FIRST) ─────────────────────────────────────
+DEPEND_LINE=$(echo "$PR_BODY" | grep -m1 "DEPEND ON #" || true)
+
+if [[ -n "$DEPEND_LINE" ]]; then
+  PARENT_PR=$(echo "$DEPEND_LINE" | grep -oP '(?<=DEPEND ON #)\d+')
+  info "Checking dependency #$PARENT_PR..."
+
+  STATE=$(gh pr view "$PARENT_PR" --json state --jq '.state' 2>/dev/null || true)
+
+  if [[ "$STATE" == "MERGED" ]]; then
+    info "Removing resolved dependency..."
+    NEW_BODY=$(echo "$NEW_BODY" | grep -v "DEPEND ON #$PARENT_PR" | sed '/./,$!d')
+    ok "Dependency removed"
+  else
+    info "Dependency still active ($STATE)"
+  fi
+else
+  info "No dependency found"
+fi
+
+# ── 2. Clipboard image handling (SINGLE SOURCE OF TRUTH) ────────────────────
+
+if clipboard_has_image; then
+  IMG_TAG=$(upload_clipboard_image) \
+    || die "Image upload failed"
+
+  if [[ "$REP_IMG" == true ]]; then
+    info "Replacing images..."
+
+    NEW_BODY=$(echo "$NEW_BODY" | python3 -c "
+import sys, re
+body = sys.stdin.read()
+body = re.sub(r'<img\s[^>]*/?\s*>', '', body)
+print(body.rstrip())
+")
+
+    NEW_BODY="${NEW_BODY}"$'\n'"${IMG_TAG}"
+
+    ok "Images replaced"
+
+  else
+    info "Appending clipboard image..."
+
+    NEW_BODY="${NEW_BODY}"$'\n'"${IMG_TAG}"
+
+    ok "Image appended"
+  fi
+
+elif [[ "$REP_IMG" == true ]]; then
+  die "--set-img used but no clipboard image found"
+fi
+
+# ── 3. No-op check ───────────────────────────────────────────────────────────
+if [[ "$NEW_BODY" == "$PR_BODY" ]]; then
+  info "No changes"
+  exit 0
+fi
+
+# ── 4. Update PR ─────────────────────────────────────────────────────────────
+info "Updating PR..."
+
+REPO=$(git remote get-url upstream 2>/dev/null | sed 's|.*github.com[:/]||;s|.git$||') \
+  || die "Cannot detect repo"
+
+TMP=$(mktemp)
+printf '%s' "$NEW_BODY" > "$TMP"
+
+ESCAPED=$(python3 -c "import json; print(json.dumps(open('$TMP').read()))")
+
+HTTP_CODE=$(curl -s -o /tmp/pr-update.txt -w "%{http_code}" \
+  -X PATCH \
+  -H "Authorization: Bearer $(gh auth token)" \
+  -H "Accept: application/vnd.github+json" \
+  -H "Content-Type: application/json" \
+  -d "{\"body\": $ESCAPED}" \
+  "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER")
+
+rm -f "$TMP"
+
+if [[ "$HTTP_CODE" == "200" ]]; then
+  ok "PR updated"
+else
+  cat /tmp/pr-update.txt
+  die "Update failed ($HTTP_CODE)"
+fi
+
+echo ""
+echo "── Actions ──────────────────────────────────────────────────────────────────"
+echo -e "${D}[r: subtasks]  ·  [r: prlist]  ·  [r: update-pr --set-img]  ·  [r: update-pr]${NC}"

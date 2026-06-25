@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# prstack: Show the stacked PR chain for the current branch
+# Usage: prstack
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+die()  { echo "❌ $*" >&2; exit 1; }
+
+# ── Get current branch ────────────────────────────────────────────────────────
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) \
+  || die "Not inside a git repository."
+
+[[ "$BRANCH" == "HEAD" ]] && die "Detached HEAD state. Check out a branch first."
+
+# ── Build map of full commit hash -> branch name ──────────────────────────────
+declare -A BRANCH_TIP_MAP
+
+while IFS= read -r line; do
+  hash=$(echo "$line" | awk '{print $1}')
+  ref=$(echo "$line" | awk '{print $2}')
+  branch_name=$(echo "$ref" | sed 's|refs/remotes/origin/||;s|refs/remotes/upstream/||;s|refs/heads/||')
+  BRANCH_TIP_MAP["$hash"]="$branch_name"
+done < <(git for-each-ref --format='%(objectname) %(refname)' refs/heads refs/remotes/origin refs/remotes/upstream 2>/dev/null)
+
+# ── Walk up the stack from current branch ────────────────────────────────────
+# Build the chain: current -> parent -> grandparent -> ... -> base
+STACK=("$BRANCH")
+SEARCH_BRANCH="$BRANCH"
+
+while true; do
+  PARENT=""
+  while IFS= read -r commit_hash; do
+    if [[ -n "${BRANCH_TIP_MAP[$commit_hash]+_}" ]]; then
+      CANDIDATE="${BRANCH_TIP_MAP[$commit_hash]}"
+      # Skip if same as current search branch or already in stack
+      if [[ "$CANDIDATE" != "$SEARCH_BRANCH" ]]; then
+        PARENT="$CANDIDATE"
+        break
+      fi
+    fi
+  done < <(git log --pretty=format:'%H' "$SEARCH_BRANCH" 2>/dev/null | tail -n +2)
+
+  [[ -z "$PARENT" ]] && break
+  STACK=("$PARENT" "${STACK[@]}")
+  SEARCH_BRANCH="$PARENT"
+
+  # Stop if we've hit a non-Jira base branch
+  if [[ ! "$PARENT" =~ ^[A-Z]+-[0-9]+$ ]]; then
+    break
+  fi
+done
+
+# ── Lookup PR number for each branch ─────────────────────────────────────────
+echo ""
+echo "🔗 PR Stack"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+TOTAL=${#STACK[@]}
+for i in "${!STACK[@]}"; do
+  BR="${STACK[$i]}"
+  IS_CURRENT=false
+  [[ "$BR" == "$BRANCH" ]] && IS_CURRENT=true
+
+  # Get PR number
+  PR_NUMBER=$(gh pr list --head "$BR" --json number --jq '.[0].number' 2>/dev/null) || true
+  PR_URL=$(gh pr list --head "$BR" --json url --jq '.[0].url' 2>/dev/null) || true
+
+  if [[ -n "$PR_NUMBER" && "$PR_NUMBER" != "null" ]]; then
+    PR_LABEL="PR #${PR_NUMBER}"
+  else
+    PR_LABEL="no PR"
+  fi
+
+  # Build display line
+  PREFIX="  "
+  SUFFIX=""
+  $IS_CURRENT && SUFFIX=" ◀ you are here"
+
+  if [[ ! "$BR" =~ ^[A-Z]+-[0-9]+$ ]]; then
+    # Base branch
+    echo "${PREFIX}📦 $BR (base)"
+  else
+    echo "${PREFIX}🔀 $BR  [${PR_LABEL}]${SUFFIX}"
+    [[ -n "$PR_URL" && "$PR_URL" != "null" ]] && echo "      $PR_URL"
+  fi
+
+  # Arrow between items
+  if [[ $i -lt $((TOTAL - 1)) ]]; then
+    echo "      ↑"
+  fi
+done
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+C='\033[0;36m'
+R='\033[0;31m'
+NC='\033[0m'
+
+info() { echo -e "${C}▶${NC} $*"; }
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+
+GIT_DIR=$(git rev-parse --absolute-git-dir 2>/dev/null) \
+  || die "Not inside a git repository."
+
+CW_DIR="$GIT_DIR/cw"
+CONFIG_FILE="$CW_DIR/fix-version"
+
+mkdir -p "$CW_DIR"
+
+case "${1:-}" in
+  "")
+    [[ -f "$CONFIG_FILE" ]] \
+      || die "No fix version configured."
+
+    cat "$CONFIG_FILE"
+    ;;
+
+  --clear)
+    rm -f "$CONFIG_FILE"
+    info "Fix version cleared."
+    ;;
+
+  -h|--help)
+    cat <<EOF
+Usage:
+  fix-version              Show configured fix version
+  fix-version <id>         Set fix version id
+  fix-version --clear      Clear fix version
+EOF
+    ;;
+
+  *)
+    echo "$1" > "$CONFIG_FILE"
+    info "Fix version set to: $1"
+    ;;
+esac

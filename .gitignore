@@ -1,0 +1,47 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Shell-specific
+*.bak
+
+# Generated output
+dist/
+build/
+out/
+
+# Test coverage
+coverage/
+.coverage
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Executable binaries
+*.out
+*.exe
+webi
+claude
+mise

@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+C='\033[0;36m'
+R='\033[0;31m'
+G='\033[0;32m'
+NC='\033[0m'
+
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+
+# ── Git repo config location ────────────────────────────────────────────────
+GIT_DIR=$(git rev-parse --absolute-git-dir 2>/dev/null) \
+  || die "Not inside a git repository."
+
+CW_DIR="$GIT_DIR/cw"
+PT_FILE="$CW_DIR/parent-tickets"
+
+mkdir -p "$CW_DIR"
+
+# ── Commands ────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  "")
+    [[ -f "$PT_FILE" ]] \
+      || die "No parent tickets configured."
+
+    cat "$PT_FILE"
+    exit 0
+    ;;
+
+  --clear)
+    rm -f "$PT_FILE"
+    ok "Parent tickets cleared."
+    exit 0
+    ;;
+
+  --add)
+    shift
+
+    [[ $# -gt 0 ]] \
+      || die "Usage: pt --add <ticket> [ticket ...]"
+
+    touch "$PT_FILE"
+
+    for ticket in "$@"; do
+      grep -qxF "$ticket" "$PT_FILE" 2>/dev/null \
+        || echo "$ticket" >> "$PT_FILE"
+    done
+
+    ok "Parent tickets updated."
+    exit 0
+    ;;
+
+  --remove)
+    shift
+
+    [[ $# -gt 0 ]] \
+      || die "Usage: pt --remove <ticket> [ticket ...]"
+
+    [[ -f "$PT_FILE" ]] \
+      || die "No parent tickets configured."
+
+    TMP=$(mktemp)
+
+    cp "$PT_FILE" "$TMP"
+
+    for ticket in "$@"; do
+      grep -vxF "$ticket" "$TMP" > "${TMP}.new" || true
+      mv "${TMP}.new" "$TMP"
+    done
+
+    mv "$TMP" "$PT_FILE"
+
+    ok "Parent tickets updated."
+    exit 0
+    ;;
+
+  -h|--help)
+    cat <<EOF
+Usage:
+  pt
+      Show parent tickets
+
+  pt CW-35106 CW-34703 ...
+      Replace all parent tickets
+
+  pt --add CW-36001 CW-36002
+      Add tickets
+
+  pt --remove CW-34703
+      Remove tickets
+
+  pt --clear
+      Clear all tickets
+
+Examples:
+  pt CW-35106 CW-34703 CW-34695
+  pt --add CW-36001
+  pt --remove CW-34703
+  pt
+EOF
+    exit 0
+    ;;
+esac
+
+# ── Default action: replace all tickets ─────────────────────────────────────
+
+: > "$PT_FILE"
+
+for ticket in "$@"; do
+  echo "$ticket" >> "$PT_FILE"
+done
+
+ok "Parent tickets set."

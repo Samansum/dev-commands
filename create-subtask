@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# create-subtask: Creates a Jira subtask under a parent ticket
+# Usage: create-subtask <PARENT-KEY> -s "Summary" [-d "Description"]
+#
+# Required env vars for URL/image clipboard support:
+#   JIRA_EMAIL      your Atlassian account email
+#   JIRA_API_TOKEN  API token from https://id.atlassian.com/manage-profile/security/api-tokens
+
+set -euo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+R='\033[0;31m'      # Red
+O='\033[38;5;208m'  # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+error()  { echo -e "${R}✖${NC} $*"; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+link() { echo -e "${B}↗${NC} $*"; }
+warn() { echo -e "${O}▲${NC} $*"; }
+
+# ── Parse arguments ───────────────────────────────────────────────────────────
+PARENT_KEY=""
+SUMMARY=""
+DESCRIPTION=""
+
+if [[ $# -eq 0 ]]; then
+  echo "Usage: create-subtask <PARENT-KEY> -s \"Summary\" [-d \"Description\"]"
+  echo "  <PARENT-KEY>       Parent Jira ticket key (e.g. CW-123)"
+  echo "  -s <summary>       Subtask summary (required)"
+  echo "  -d <description>   Subtask description (optional)"
+  exit 0
+fi
+
+# First positional arg is the parent key
+PARENT_KEY="$1"
+shift
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--summary)     SUMMARY="$2";     shift 2 ;;
+    -d|--description) DESCRIPTION="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: create-subtask <PARENT-KEY> -s \"Summary\" [-d \"Description\"]"
+      echo "  <PARENT-KEY>       Parent Jira ticket key (e.g. CW-123)"
+      echo "  -s <summary>       Subtask summary (required)"
+      echo "  -d <description>   Subtask description (optional)"
+      exit 0 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+# ── Validate inputs ───────────────────────────────────────────────────────────
+[[ -z "$PARENT_KEY" ]] && die "Parent ticket key is required (e.g. CW-123)."
+[[ -z "$SUMMARY" ]]    && die "Summary is required. Use -s \"Your summary here\"."
+
+if [[ ! "$PARENT_KEY" =~ ^[A-Z]+-[0-9]+$ ]]; then
+  die "Parent key '$PARENT_KEY' doesn't look like a Jira ticket key (e.g. CW-123)."
+fi
+
+PROJECT_KEY="${PARENT_KEY%%-*}"
+info "Parent ticket: $PARENT_KEY"
+info "Project key:   $PROJECT_KEY"
+
+# ── Check clipboard ───────────────────────────────────────────────────────────
+CLIPBOARD_ADF=""
+CLIPBOARD_HTML=""
+CLIPBOARD_TEXT=""
+CLIPBOARD_URL=""
+
+if command -v xclip &>/dev/null; then
+
+  # 1. Try Jira/Atlassian ADF clipboard (MOST IMPORTANT)
+  CLIPBOARD_ADF=$(xclip -selection clipboard -t application/json -o 2>/dev/null || true)
+
+  # Sometimes Jira uses this MIME instead
+  if [[ -z "$CLIPBOARD_ADF" ]]; then
+    CLIPBOARD_ADF=$(xclip -selection clipboard -t application/vnd.atlaskit+json -o 2>/dev/null || true)
+  fi
+
+  # 2. HTML fallback
+  if [[ -z "$CLIPBOARD_ADF" ]]; then
+    CLIP_TYPE=$(xclip -selection clipboard -t TARGETS -o 2>/dev/null || true)
+
+    if echo "$CLIP_TYPE" | grep -q "text/html"; then
+      CLIPBOARD_HTML=$(xclip -selection clipboard -t text/html -o 2>/dev/null || true)
+    fi
+  fi
+
+  # 3. Plain text / URL fallback
+  if [[ -z "$CLIPBOARD_ADF" && -z "$CLIPBOARD_HTML" ]]; then
+    CLIPBOARD_TEXT=$(xclip -selection clipboard -t text/plain -o 2>/dev/null || true)
+  fi
+fi
+
+# ── Build ADF description ─────────────────────────────────────────────────────
+# Combines optional -d text and optional clipboard URL into an ADF JSON doc.
+# Passed to acli via --description-file.
+TMP_DESC_FILE=""
+
+if [[ -n "$DESCRIPTION" || -n "$CLIPBOARD_TEXT" || -n "$CLIPBOARD_URL" || -n "$CLIPBOARD_HTML" ]]; then
+  TMP_DESC_FILE=$(mktemp /tmp/subtask-desc-XXXXXX.json)
+
+  python3 - \
+    "${DESCRIPTION:-}" \
+    "${CLIPBOARD_TEXT:-}" \
+    "${CLIPBOARD_URL:-}" \
+    "${CLIPBOARD_HTML:-}" \
+    "${CLIPBOARD_ADF:-}" \
+    > "$TMP_DESC_FILE" << 'PYEOF'
+import sys, json
+
+description = sys.argv[1]
+clipboard   = sys.argv[2]
+url         = sys.argv[3]
+html        = sys.argv[4]
+adf         = sys.argv[5]
+
+# ✅ If Jira already gave us ADF → use it directly
+if adf:
+    try:
+        parsed = json.loads(adf)
+
+        # Optional safety: ensure valid ADF structure
+        if isinstance(parsed, dict) and "content" in parsed:
+            print(json.dumps(parsed))
+            sys.exit(0)
+
+    except Exception:
+        # fallback to normal processing if broken
+        pass
+
+content = []
+
+def add_paragraph(text):
+    text = text.strip()
+    if not text:
+        return
+    content.append({
+        "type": "paragraph",
+        "content": [{"type": "text", "text": text}]
+    })
+
+if description:
+    add_paragraph(description)
+
+if html:
+    # keep your simple HTML stripper OR ignore for Jira-to-Jira copy
+    add_paragraph(html)
+
+elif clipboard:
+    for para in clipboard.split("\n\n"):
+        add_paragraph(para)
+
+if url:
+    content.append({
+        "type": "paragraph",
+        "content": [{
+            "type": "inlineCard",
+            "attrs": {"url": url}
+        }]
+    })
+
+print(json.dumps({
+    "version": 1,
+    "type": "doc",
+    "content": content
+}))
+PYEOF
+
+  info "Description: (set)"
+fi
+
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
+cleanup() {
+  [[ -n "${TMP_DESC_FILE:-}"    && -f "$TMP_DESC_FILE"    ]] && rm -f "$TMP_DESC_FILE"
+  # Only delete clipboard file if it's a temp file we created (not a user's file)
+  if [[ -n "${CLIPBOARD_FILE_PATH:-}" && -f "$CLIPBOARD_FILE_PATH" ]]; then
+    [[ "$CLIPBOARD_FILE_PATH" == /tmp/clipboard-* ]] && rm -f "$CLIPBOARD_FILE_PATH"
+  fi
+}
+trap cleanup EXIT
+
+# ── Create the subtask via acli ───────────────────────────────────────────────
+info "Creating subtask under $PARENT_KEY..."
+info "Summary: \"$SUMMARY\""
+
+CREATE_ARGS=(
+  jira workitem create
+  --project "$PROJECT_KEY"
+  --type    "Sub-task"
+  --summary "$SUMMARY"
+  --parent  "$PARENT_KEY"
+)
+
+[[ -n "$TMP_DESC_FILE" ]] && CREATE_ARGS+=(--description-file "$TMP_DESC_FILE")
+
+echo ""
+echo "🚀 Creating subtask..."
+OUTPUT=$(acli "${CREATE_ARGS[@]}" 2>&1) \
+  || die "Failed to create subtask. Is acli authenticated? Run: acli jira auth login --web\n\nRaw output: $OUTPUT"
+
+echo "$OUTPUT"
+
+# ── Extract the new ticket key ────────────────────────────────────────────────
+NEW_KEY=$(echo "$OUTPUT" | grep -oP '[A-Z]+-[0-9]+' | head -1 || true)
+
+if [[ -z "$NEW_KEY" ]]; then
+  warn "Could not extract new ticket key from output — skipping attachment upload."
+  exit 0
+fi
+
+JIRA_URL="${JIRA_BASE_URL}/browse/${NEW_KEY}"
+echo ""
+ok "Subtask created: $NEW_KEY"
+link "$JIRA_URL"
+
+# ── Upload clipboard file as attachment ───────────────────────────────────────
+if [[ -n "${CLIPBOARD_FILE_PATH:-}" ]]; then
+  if [[ -z "${JIRA_EMAIL:-}" || -z "${JIRA_API_TOKEN:-}" ]]; then
+    echo ""
+    warn "File in clipboard but JIRA_EMAIL / JIRA_API_TOKEN not set — skipping attachment."
+    echo "   Add to ~/.zshrc:"
+    echo "     export JIRA_EMAIL=\"you@khalibre.com\""
+    echo "     export JIRA_API_TOKEN=\"your-token-from-id.atlassian.com\""
+  else
+    ATTACH_FILENAME=$(basename "$CLIPBOARD_FILE_PATH")
+    info "Uploading clipboard file as attachment to $NEW_KEY ($ATTACH_FILENAME)..."
+
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+      -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+      -H "X-Atlassian-Token: no-check" \
+      -F "file=@${CLIPBOARD_FILE_PATH};type=${CLIPBOARD_FILE_MIME};filename=${ATTACH_FILENAME}" \
+      "${JIRA_BASE_URL}/rest/api/3/issue/${NEW_KEY}/attachments")
+
+    if [[ "$HTTP_CODE" == "200" ]]; then
+      info "File attached to $NEW_KEY."
+    else
+      warn "Attachment upload failed (HTTP $HTTP_CODE)."
+    fi
+  fi
+fi

@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# standup-preview: Preview standup summary and optionally send to Telegram
+# Usage: standup-preview
+
+set -eo pipefail
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+R='\033[0;31m'      # Red
+O='\033[38;5;208m'  # Orange
+Y='\033[0;33m'      # Yellow
+G='\033[0;32m'      # Green
+B='\033[0;34m'      # Blue
+W='\033[1;37m'      # Bright White
+D='\033[0;90m'      # Dark Gray
+C='\033[0;36m'      # Cyan
+M='\033[0;35m'      # Magenta
+NC='\033[0m'        # Reset / No Color
+
+die()  { echo -e "${R}✖${NC} $*" >&2; exit 1; }
+error()  { echo -e "${R}✖${NC} $*"; }
+info() { echo -e "${C}▶${NC} $*"; }
+ok()   { echo -e "${G}✔${NC} $*"; }
+warn() { echo -e "${O}▲${NC} $*"; }
+
+[[ -z "${TELEGRAM_BOT_TOKEN:-}" ]] \
+  && die "TELEGRAM_BOT_TOKEN is not set. Add to ~/.zshrc: export TELEGRAM_BOT_TOKEN=\"your-token\""
+[[ -z "${TELEGRAM_CHAT_ID:-}" ]] \
+  && die "TELEGRAM_CHAT_ID is not set. Add to ~/.zshrc: export TELEGRAM_CHAT_ID=\"your-chat-id\""
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+W='\033[1;37m'; D='\033[0;90m'; C='\033[0;36m'; NC='\033[0m'
+
+# ── Time boundaries ───────────────────────────────────────────────────────────
+TODAY=$(date +%Y-%m-%d)
+MIDNIGHT_TODAY="${TODAY} 00:00"
+NOW=$(date '+%Y-%m-%d %H:%M')
+
+# ── Find previous workday (skip weekends + Cambodia public holidays) ──────────
+find_prev_workday() {
+  local check_date year
+  local holidays=()
+  check_date=$(date -d "yesterday" +%Y-%m-%d)
+
+  for i in $(seq 1 14); do
+    local dow=$(date -d "$check_date" +%u)
+    if [[ "$dow" == "6" || "$dow" == "7" ]]; then
+      check_date=$(date -d "$check_date - 1 day" +%Y-%m-%d)
+      continue
+    fi
+
+    year=$(date -d "$check_date" +%Y)
+    if [[ ${#holidays[@]} -eq 0 && -n "${CALENDARIFIC_API_KEY:-}" ]]; then
+      local raw
+      raw=$(curl -sf "https://calendarific.com/api/v2/holidays?api_key=${CALENDARIFIC_API_KEY}&country=KH&year=${year}&type=national" 2>/dev/null) || true
+      if [[ -n "$raw" ]]; then
+        mapfile -t holidays < <(echo "$raw" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for h in data['response']['holidays']:
+    print(h['date']['iso'])
+")
+      fi
+    fi
+
+    local is_holiday=false
+    for h in "${holidays[@]}"; do
+      [[ "$h" == "$check_date" ]] && is_holiday=true && break
+    done
+
+    [[ "$is_holiday" == false ]] && echo "$check_date" && return
+    check_date=$(date -d "$check_date - 1 day" +%Y-%m-%d)
+  done
+  date -d "yesterday" +%Y-%m-%d
+}
+
+PREV_WORKDAY=$(find_prev_workday)
+PREV_WORKDAY_START="${PREV_WORKDAY} 00:00"
+PREV_WORKDAY_END="${PREV_WORKDAY} 23:59"
+
+ACTUAL_YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
+PREV_WORKDAY_LABEL=$(date -d "$PREV_WORKDAY" '+%A, %B %d %Y')
+TODAY_LABEL=$(date '+%A, %B %d %Y')
+if [[ "$PREV_WORKDAY" == "$ACTUAL_YESTERDAY" ]]; then
+  YESTERDAY_TITLE="Yesterday ($PREV_WORKDAY_LABEL)"
+else
+  YESTERDAY_TITLE="$PREV_WORKDAY_LABEL"
+fi
+
+info "This Morning: $MIDNIGHT_TODAY → $NOW"
+info "Yesterday:    $PREV_WORKDAY_START → $PREV_WORKDAY_END"
+
+# ── Fetch upstream repo ───────────────────────────────────────────────────────
+UPSTREAM_REPO=$(git remote get-url upstream 2>/dev/null \
+  | sed 's|.*github.com[:/]||;s|.git$||') \
+  || die "Could not get upstream repo."
+
+# ── Jira queries ──────────────────────────────────────────────────────────────
+info "Fetching Jira tickets..."
+
+YESTERDAY_TICKETS_JSON=$(acli jira workitem search \
+  --jql "assignee = currentUser() AND status changed to 'In Progress' during ('${PREV_WORKDAY_START}', '${PREV_WORKDAY_END}')" \
+  --fields "key,summary" --json 2>/dev/null) || YESTERDAY_TICKETS_JSON="[]"
+
+MORNING_TICKETS_JSON=$(acli jira workitem search \
+  --jql "assignee = currentUser() AND status changed to 'In Progress' during ('${MIDNIGHT_TODAY}', '${NOW}')" \
+  --fields "key,summary" --json 2>/dev/null) || MORNING_TICKETS_JSON="[]"
+
+CURRENT_TICKETS_JSON=$(acli jira workitem search \
+  --jql "assignee = currentUser() AND status = 'In Progress' ORDER BY updated DESC" \
+  --fields "key,summary" --json 2>/dev/null) || CURRENT_TICKETS_JSON="[]"
+
+# ── Parse tickets ─────────────────────────────────────────────────────────────
+declare -A TICKET_SUMMARY
+YESTERDAY_TICKET_KEYS=()
+MORNING_TICKET_KEYS=()
+CURRENT_TICKET_KEYS=()
+
+parse_tickets() {
+  local json="$1"
+  local -n out_arr=$2
+  while IFS=$'\t' read -r key summary; do
+    [[ -z "$key" ]] && continue
+    out_arr+=("$key")
+    TICKET_SUMMARY["$key"]="$summary"
+  done < <(echo "$json" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, list):
+        for item in data:
+            print(item['key'] + '\t' + item['fields']['summary'])
+except: pass
+" 2>/dev/null)
+}
+
+parse_tickets "$YESTERDAY_TICKETS_JSON" YESTERDAY_TICKET_KEYS
+parse_tickets "$MORNING_TICKETS_JSON"   MORNING_TICKET_KEYS
+parse_tickets "$CURRENT_TICKETS_JSON"   CURRENT_TICKET_KEYS
+
+# -- remove current tickets from morning tickets
+declare -A _CURRENT_SET=()
+
+for t in "${CURRENT_TICKET_KEYS[@]}"; do
+  _CURRENT_SET["$t"]=1
+done
+
+FILTERED_MORNING_TICKET_KEYS=()
+
+for t in "${MORNING_TICKET_KEYS[@]}"; do
+  [[ -z "${_CURRENT_SET[$t]+_}" ]] && FILTERED_MORNING_TICKET_KEYS+=("$t")
+done
+
+MORNING_TICKET_KEYS=("${FILTERED_MORNING_TICKET_KEYS[@]}")
+
+# ── Get commits for a ticket from its GitHub PR ───────────────────────────────
+# For open PRs: exclude commits from dependent PRs (DEPEND ON #xxx in description)
+# For merged/closed PRs: show all commits as-is
+get_ticket_commits() {
+  local ticket="$1"
+
+  # Find PR for this ticket on upstream
+  local pr_json
+  pr_json=$(gh pr list \
+    --repo "$UPSTREAM_REPO" \
+    --head "$ticket" \
+    --state all \
+    --json number,state,body \
+    --limit 1 2>/dev/null) || return
+
+  local pr_number pr_state pr_body
+  pr_number=$(echo "$pr_json" | python3 -c "
+import sys,json; d=json.load(sys.stdin); print(d[0]['number'] if d else '')" 2>/dev/null) || true
+  pr_state=$(echo "$pr_json" | python3 -c "
+import sys,json; d=json.load(sys.stdin); print(d[0]['state'] if d else '')" 2>/dev/null) || true
+  pr_body=$(echo "$pr_json" | python3 -c "
+import sys,json; d=json.load(sys.stdin); print(d[0]['body'] if d else '')" 2>/dev/null) || true
+
+  [[ -z "$pr_number" ]] && return
+
+  # Get all commits from this PR
+  local all_commits
+  all_commits=$(gh api "repos/$UPSTREAM_REPO/pulls/$pr_number/commits" \
+    --jq '.[].commit.message | split("\n")[0]' 2>/dev/null) || return
+
+  [[ -z "$all_commits" ]] && return
+
+  # For open PRs: find DEPEND ON #xxx and exclude those commits
+  if [[ "$pr_state" == "OPEN" ]]; then
+    local depend_pr
+    depend_pr=$(echo "$pr_body" | grep -oP '(?<=DEPEND ON #)\d+' | head -1) || true
+
+    if [[ -n "$depend_pr" ]]; then
+      # Get commits from the dependent PR
+      local depend_commits
+      depend_commits=$(gh api "repos/$UPSTREAM_REPO/pulls/$depend_pr/commits" \
+        --jq '.[].commit.message | split("\n")[0]' 2>/dev/null) || true
+
+      if [[ -n "$depend_commits" ]]; then
+        # Exclude dependent commits from this PR's commit list
+        echo "$all_commits" | python3 -c "
+import sys
+all_c = sys.stdin.read().splitlines()
+depend = set('''$depend_commits'''.splitlines())
+for c in all_c:
+    if c not in depend:
+        print(c)
+"
+        return
+      fi
+    fi
+  fi
+
+  echo "$all_commits"
+}
+
+# ── Fetch commits for each ticket ─────────────────────────────────────────────
+declare -A TICKET_COMMITS
+
+# Collect all unique ticket keys
+declare -A _ALL_SEEN
+ALL_TICKET_KEYS=()
+for k in "${YESTERDAY_TICKET_KEYS[@]}" "${MORNING_TICKET_KEYS[@]}" "${CURRENT_TICKET_KEYS[@]}"; do
+  if [[ -z "${_ALL_SEEN[$k]+_}" ]]; then
+    ALL_TICKET_KEYS+=("$k")
+    _ALL_SEEN["$k"]=1
+  fi
+done
+
+info "Fetching commits from GitHub PRs..."
+for TICKET in "${ALL_TICKET_KEYS[@]}"; do
+  COMMITS=$(get_ticket_commits "$TICKET")
+  [[ -n "$COMMITS" ]] && TICKET_COMMITS["$TICKET"]="$COMMITS"
+done
+
+# ── Terminal output ───────────────────────────────────────────────────────────
+print_section() {
+  local title="$1" emoji="$2"
+  local -n keys=$3
+  local printed=0
+
+  echo ""
+  echo -e "${W}${emoji} ${title}${NC}"
+  echo -e "${D}$(printf '─%.0s' {1..50})${NC}"
+
+  for TICKET in "${keys[@]}"; do
+    local commits="${TICKET_COMMITS[$TICKET]:-}"
+    echo -e "  ${C}${TICKET}${NC} ${TICKET_SUMMARY[$TICKET]:-$TICKET}"
+    if [[ -n "$commits" ]]; then
+      while IFS= read -r c; do
+        [[ -n "$c" ]] && echo -e "    ${D}↳${NC} $c"
+      done <<< "$commits"
+    else
+      echo -e "    ${D}↳ no commits${NC}"
+    fi
+    ((++printed))
+  done
+
+  if [[ $printed -eq 0 ]]; then
+    echo -e "  ${D}no tickets${NC}"
+  fi
+
+  return 0
+}
+
+print_section "$YESTERDAY_TITLE"            "📅" YESTERDAY_TICKET_KEYS
+print_section "This Morning ($TODAY_LABEL)" "🌅" MORNING_TICKET_KEYS
+
+echo ""
+echo -e "${W}🎯 Current Tasks${NC}"
+echo -e "${D}$(printf '─%.0s' {1..50})${NC}"
+if [[ ${#CURRENT_TICKET_KEYS[@]} -gt 0 ]]; then
+  for TICKET in "${CURRENT_TICKET_KEYS[@]}"; do
+    echo -e "  ${C}${TICKET}${NC} ${TICKET_SUMMARY[$TICKET]:-$TICKET}"
+  done
+else
+  echo -e "  ${D}no current tasks detected${NC}"
+fi
+echo ""
+
+# ── Escape for Telegram HTML ──────────────────────────────────────────────────
+escape_html() {
+  python3 -c "
+import sys
+text = sys.stdin.read().rstrip()
+text = text.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+print(text, end='')
+" <<< "$1"
+}
+
+# -----------------------------
+# NEW: Standup feature
+# -----------------------------
+standup_preview() {
+  local api_key="$GEMINI_API_KEY"
+  local model="gemini-2.5-flash"
+
+  local payload=""
+  payload+="You are a technical standup summarizer.\n\n"
+  payload+="Return concise bullet points grouped by Yesterday and This Morning.\n"
+  payload+="Do NOT include raw commits or ticket IDs in output.\n"
+  payload+="If a section has no data, write 'No updates'.\n\n"
+
+  payload+="=== YESTERDAY ===\n"
+
+  if [[ ${#YESTERDAY_TICKET_KEYS[@]} -eq 0 ]]; then
+    payload+="- No updates\n"
+  else
+    for TICKET in "${YESTERDAY_TICKET_KEYS[@]}"; do
+      payload+="- $TICKET: ${TICKET_SUMMARY[$TICKET]}\n"
+    done
+  fi
+
+  payload+="\n=== THIS MORNING ===\n"
+
+  if [[ ${#MORNING_TICKET_KEYS[@]} -eq 0 ]]; then
+    payload+="- No updates\n"
+  else
+    for TICKET in "${MORNING_TICKET_KEYS[@]}"; do
+      payload+="- $TICKET: ${TICKET_SUMMARY[$TICKET]}\n"
+    done
+  fi
+
+  local response
+  response=$(curl -s "https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${api_key}" \
+    -H "Content-Type: application/json" \
+    -d @- <<EOF
+{
+  "contents": [{
+    "parts": [{
+      "text": $(printf '%s' "$payload" | jq -Rs .)
+    }]
+  }],
+  "generationConfig": {
+    "temperature": 0.4,
+    "maxOutputTokens": 600
+  }
+}
+EOF
+)
+
+  echo "$response" | jq -r '.candidates[0].content.parts[0].text'
+}
+
+# ── Build Telegram message ────────────────────────────────────────────────────
+build_tg_section() {
+  local title="$1" emoji="$2"
+  local -n keys=$3
+
+  local out="\n${emoji} <b>${title}</b>\n"
+  local idx=1 printed=0
+
+  for TICKET in "${keys[@]}"; do
+    local summary ticket_esc commits
+    summary=$(escape_html "${TICKET_SUMMARY[$TICKET]:-$TICKET}")
+    ticket_esc=$(escape_html "$TICKET")
+    commits="${TICKET_COMMITS[$TICKET]:-}"
+
+    if [[ -n "$commits" ]]; then
+      out+="  ${idx}. <b>${ticket_esc}</b>: ${summary}\n"
+
+      # Expandable commit block
+      out+="<blockquote expandable>\n"
+      while IFS= read -r c; do
+        [[ -n "$c" ]] && out+="↳ $(escape_html "$c")\n"
+      done <<< "$commits"
+      out+="</blockquote>\n"
+
+    else
+      out+="  ${idx}. ${ticket_esc}: ${summary} <i>(no commits)</i>\n"
+    fi
+
+    ((++idx)); ((++printed))
+  done
+
+  [[ $printed -eq 0 ]] && out+="  <i>no tickets</i>\n"
+  echo "$out"
+}
+
+MSG="🗓 <b>Standup — $(date '+%A, %B %d %Y')</b>\n"
+MSG+="$(build_tg_section "$YESTERDAY_TITLE" "📅" YESTERDAY_TICKET_KEYS)"
+MSG+="$(build_tg_section "This Morning ($TODAY_LABEL)" "🌅" MORNING_TICKET_KEYS)"
+MSG+="\n🎯 <b>Current Tasks</b>\n"
+if [[ ${#CURRENT_TICKET_KEYS[@]} -gt 0 ]]; then
+  for TICKET in "${CURRENT_TICKET_KEYS[@]}"; do
+    MSG+="  <b>$(escape_html "$TICKET")</b>: $(escape_html "${TICKET_SUMMARY[$TICKET]:-$TICKET}")\n"
+  done
+else
+  MSG+="  <i>no current tasks detected</i>"
+fi
+
+#MSG=$(standup_preview)
+
+# ── Prompt before sending ────────────────────────────────────────────────────
+AUTO_YES=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes)
+      AUTO_YES=true
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [[ "$AUTO_YES" != true ]]; then
+  echo ""
+  read -r -p "Send this to Telegram? [y/N]: " CONFIRM
+  if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Not sent."
+    exit 0
+  fi
+fi
+
+# ── Send to Telegram ──────────────────────────────────────────────────────────
+info "Sending to Telegram..."
+
+PAYLOAD=$(python3 -c "
+import json, sys
+msg = sys.argv[1]
+print(json.dumps({'chat_id': '$TELEGRAM_CHAT_ID', 'text': msg, 'parse_mode': 'HTML'}))
+" "$(echo -e "$MSG")")
+
+HTTP_CODE=$(curl -s -o /tmp/telegram_response.txt -w "%{http_code}" \
+  -X POST -H "Content-Type: application/json" \
+  -d "$PAYLOAD" \
+  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage")
+
+if [[ "$HTTP_CODE" == "200" ]]; then
+  ok "Standup sent to Telegram!"
+else
+  warn "Telegram API responded with HTTP $HTTP_CODE"
+  cat /tmp/telegram_response.txt
+fi

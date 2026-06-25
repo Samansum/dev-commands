@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# view-pr: Open a GitHub PR in the browser
+# Usage: view-pr <pr-number>
+
+set -euo pipefail
+
+die() { echo "❌ $*" >&2; exit 1; }
+
+[[ $# -lt 1 ]] && die "Usage: view-pr <pr-number>"
+[[ ! "$1" =~ ^[0-9]+$ ]] && die "PR number must be numeric."
+
+gh pr view "$1" --web  &>/dev/null &
+disown
